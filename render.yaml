@@ -1,0 +1,35 @@
+# Render 蓝图：一键创建全栈部署（backend + frontend）
+#
+# 使用步骤：
+#   1. 把仓库推到 GitHub
+#   2. 打开 https://dashboard.render.com → New → Blueprint → 选择该仓库
+#   3. 首次部署后，在 backend 服务的 Environment 里填入真实的 DEEPSEEK_API_KEY
+#      （render.yaml 里 sync:false，key 只在 Render 后台存，镜像里永远没有）
+#
+# 免费档注意：Render 免费 Web Service 空闲 15 分钟会休眠，首次访问需等 ~50s 冷启动。
+services:
+  # ---- 后端 FastAPI（uvicorn 监听 $PORT，Render 注入为 10000）----
+  - type: web
+    name: trip-planner-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: DEEPSEEK_API_KEY
+        sync: false
+
+  # ---- 前端 nginx（托管 SPA + 反代 /api、/mcp 到后端）----
+  - type: web
+    name: trip-planner-frontend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./frontend/Dockerfile
+    envVars:
+      # 后端在 Render 私有网络内的地址（裸 host:port，nginx 模板会补 http:// 前缀）。
+      # fromService 自动解析，服务名变了也无需手改。
+      - key: BACKEND_URL
+        fromService:
+          name: trip-planner-backend
+          type: web
+          property: hostport

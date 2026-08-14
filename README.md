@@ -4,6 +4,14 @@
 
 后端 FastAPI + Pydantic，前端 Vue 3 + TypeScript。研究、行程两个 Agent 由 DeepSeek 驱动，预算 Agent 保持确定性计算，形成「**LLM 决策 + 代码执行**」的异构多 Agent 架构。
 
+> **🔥 本仓库的增量（教程之外的原创工程化）**
+>
+> 本项目基于 DataWhale「Hello Agents」教程的多 Agent 骨架，但在其之上**额外实现**了以下面试官会追问的差异化能力：
+> - **MCP 服务端**：5 个工具，stdio + streamable-http 双传输（教程没有，官方 SDK 从零接入）
+> - **Docker 全栈容器化** + nginx 反向代理（SSE 流式适配、API key 不进镜像）
+> - **pytest 冒烟测试 + GitHub Actions CI**（含 LLM 降级路径，无 key 也能全绿）
+> - **Render 云端部署蓝图**：免费一键上线，简历可直接挂 URL
+
 ## ✨ 核心能力
 
 | 能力 | 说明 |
@@ -45,6 +53,8 @@ Vue 前端（实时进度 + 行程 / 预算 / 路线图渲染）
 - **LLM**：DeepSeek `deepseek-chat`，JSON Mode + Function Calling
 - **MCP**：官方 MCP SDK（`mcp==1.28.1`），把多 Agent 能力暴露成 MCP 工具（stdio + streamable-http）
 - **部署**：Docker + docker-compose，前端 nginx 托管 + 反向代理
+- **测试/CI**：pytest 冒烟测试 + GitHub Actions（push 到 main 自动跑后端测试与前端构建）
+- **云端**：Render 蓝图（`render.yaml`）前后端一键部署，免费拿简历 URL
 
 ## 🚀 本地运行
 
@@ -81,6 +91,43 @@ docker compose down           # 停止
 - 前端：`http://localhost:5173`
 - 后端健康检查：`http://localhost:8000/api/health`
 - MCP 端点：`http://localhost:8000/mcp`
+
+## ☁️ 云端部署（Render 免费，简历挂 URL）
+
+仓库推到 GitHub 后，用仓库根目录的 `render.yaml` 蓝图一键部署前后端：
+
+1. **推 GitHub**：见下方「推到 GitHub」。
+2. **连 Render**：打开 https://dashboard.render.com → **New → Blueprint** → 选择本仓库。
+3. 等几分钟两个服务自动构建上线。
+4. 填 key：`trip-planner-backend` → **Environment** → 添加 `DEEPSEEK_API_KEY`（render.yaml 里 `sync:false`，key 只存 Render 后台，镜像里永远没有）。
+
+部署后：
+- 前端（简历 URL）：`https://trip-planner-frontend.onrender.com`
+- 后端健康检查：`https://trip-planner-backend.onrender.com/api/health`
+- MCP 端点：`https://trip-planner-backend.onrender.com/mcp`
+
+> ⚠️ 免费档：空闲 15 分钟休眠，首次访问冷启动 ~50s；`onrender.com` 国内访问可能需代理，给国内面试官演示建议录屏备用。
+
+## ✅ 测试与 CI
+
+```bash
+cd backend
+.venv/Scripts/pip install -r requirements-dev.txt
+.venv/Scripts/python -m pytest -v      # 11 个冒烟测试，秒级完成
+```
+
+- 覆盖：健康检查、`travel_minutes` 数学正确性、MCP 5 工具注册、多 Agent **降级路径**（强制 LLM 失败 → 规则引擎兜底，CI 无 API key 也能全绿）
+- CI：`.github/workflows/ci.yml`，push 到 `main` 自动跑后端 pytest + 前端类型检查与构建
+
+## 🚀 推到 GitHub
+
+```bash
+# 1. GitHub 建仓库（New repository，不要勾选 README/.gitignore）
+# 2. 关联并推送（自动触发 CI）
+git remote add origin https://github.com/<你的用户名>/trip-planner.git
+git branch -M main
+git push -u origin main
+```
 
 ## 🔌 MCP（Model Context Protocol）
 
@@ -144,13 +191,17 @@ backend/app/
   tools.py       # travel_minutes 工具（Haversine 距离计算）
   data.py        # 景点知识库（4 城市 × 10 个 POI）
   mcp_server.py  # MCP 服务端：5 个工具（plan_trip / search_places / ...）
+  tests/         # pytest 冒烟测试（健康检查 / 工具 / MCP / 降级路径）
+  requirements-dev.txt  # 测试依赖（pytest + httpx）
   Dockerfile     # 后端镜像
 frontend/
   src/App.vue    # 表单 + SSE 流式进度 + 行程/预算/路线渲染
   Dockerfile     # 前端镜像（node 构建 → nginx 托管）
-  nginx.conf     # SPA 回退 + /api、/mcp 反向代理（SSE 关缓冲）
-docker-compose.yml  # 全栈编排（backend + frontend）
-.mcp.json           # Claude Code 本地 MCP 配置（stdio）
+  nginx.conf.template  # nginx 模板（$PORT/$BACKEND_URL 注入）+ /api、/mcp 反代（SSE 关缓冲）
+docker-compose.yml       # 全栈编排（backend + frontend）
+render.yaml              # Render 蓝图（云端一键部署）
+.github/workflows/ci.yml # CI：后端 pytest + 前端构建
+.mcp.json                # Claude Code 本地 MCP 配置（stdio）
 ```
 
 ## 🧠 设计决策（面试高频）

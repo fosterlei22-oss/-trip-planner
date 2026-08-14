@@ -6,6 +6,13 @@ Run the API:
 .venv/Scripts/python -m uvicorn app.main:app --reload --port 8000
 ```
 
+Run tests (无 API key 也能全绿，走降级路径):
+
+```bash
+.venv/Scripts/pip install -r requirements-dev.txt
+.venv/Scripts/python -m pytest -v
+```
+
 Main endpoints:
 
 ```text

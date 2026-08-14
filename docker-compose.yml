@@ -27,6 +27,9 @@ services:
     build:
       context: ./frontend
     container_name: helloagents-frontend
+    # nginx 模板变量：指向 compose 网络内的 backend 服务（裸 host:port，nginx 模板补 http://）
+    environment:
+      BACKEND_URL: backend:8000
     ports:
       - "5173:80"
     depends_on:
