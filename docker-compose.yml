@@ -1,0 +1,35 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: helloagents-backend
+    env_file:
+      # 真实 API key 只在此处运行时注入，绝不打进镜像
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # python:3.11-slim 没有 curl，用 urllib 打健康检查（fast、不依赖 LLM）
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: helloagents-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

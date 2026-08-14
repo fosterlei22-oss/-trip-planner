@@ -43,6 +43,8 @@ Vue 前端（实时进度 + 行程 / 预算 / 路线图渲染）
 - **前端**：Vue 3 · TypeScript · Vite
 - **检索**：自研特征哈希向量化 + 余弦相似度（接口兼容 Chroma / Milvus，可平滑升级）
 - **LLM**：DeepSeek `deepseek-chat`，JSON Mode + Function Calling
+- **MCP**：官方 MCP SDK（`mcp==1.28.1`），把多 Agent 能力暴露成 MCP 工具（stdio + streamable-http）
+- **部署**：Docker + docker-compose，前端 nginx 托管 + 反向代理
 
 ## 🚀 本地运行
 
@@ -64,19 +66,91 @@ node node_modules/vite/bin/vite.js --host 127.0.0.1   # 或 npm run dev
 
 打开 `http://127.0.0.1:5173`。健康检查：`GET /api/health`。
 
+## 🐳 Docker 运行（全栈一键启动）
+
+前置条件：先创建 `backend/.env`（`cp backend/.env.example backend/.env`，填入 `DEEPSEEK_API_KEY`）——compose 靠它注入 API key，镜像本身不含密钥。
+
+```bash
+docker compose up --build     # 构建并启动
+docker compose up -d          # 后台运行
+docker compose logs -f        # 查看日志
+docker compose down           # 停止
+```
+
+启动后：
+- 前端：`http://localhost:5173`
+- 后端健康检查：`http://localhost:8000/api/health`
+- MCP 端点：`http://localhost:8000/mcp`
+
+## 🔌 MCP（Model Context Protocol）
+
+项目把核心能力暴露成 **MCP 服务端**，任何 MCP 客户端（Claude Desktop / Claude Code / 其他 Agent）都能直接调用。
+
+### 暴露的 5 个工具
+
+| 工具 | 说明 |
+|---|---|
+| `plan_trip` | 多 Agent 完整行程规划（RAG → 编排 → 工具调用 → 预算），返回完整 TripPlan |
+| `search_places` | RAG 语义检索，返回与兴趣最匹配的景点 |
+| `list_city_places` | 查询某城市知识库全部景点（北京/上海/杭州/成都） |
+| `travel_minutes` | 按经纬度估算市内交通时间（Haversine） |
+| `travel_minutes_between_places` | 按景点名估算两个景点间的交通时间 |
+
+### 两种接入方式
+
+**方式一：stdio（本地进程，Claude Code / Claude Desktop）**
+
+项目根目录已内置 `.mcp.json`，Claude Code 会自动发现名为 `trip-planner` 的本地 MCP 服务。也可以手动添加：
+
+```bash
+# Claude Code（需先安装后端依赖）
+claude mcp add trip-planner -- .venv/Scripts/python.exe -m app.mcp_server --cwd backend
+
+# 或手动编写 .mcp.json
+# {"mcpServers": {"trip-planner": {"command": ".venv/Scripts/python.exe", "args": ["-m","app.mcp_server"], "cwd": "backend"}}}
+```
+
+**方式二：streamable-http（远程 / Docker）**
+
+后端已把 MCP 挂载到 `/mcp`。Docker 或本地服务起来后：
+
+```json
+{
+  "mcpServers": {
+    "trip-planner-http": { "type": "http", "url": "http://localhost:8000/mcp" }
+  }
+}
+```
+
+### 用 MCP Inspector 调试
+
+```bash
+npx @modelcontextprotocol/inspector
+# Streamable HTTP → 填 http://localhost:8000/mcp
+# 或 STDIO → 命令 .venv/Scripts/python.exe，参数 -m app.mcp_server，cwd backend
+```
+
+> 注意：`plan_trip` 内部调用 DeepSeek，预期耗时 10~60 秒；未配置 API key 时自动降级为规则引擎生成。
+
 ## 📁 项目结构
 
 ```text
 backend/app/
-  main.py        # FastAPI 路由 + SSE 流式端点
+  main.py        # FastAPI 路由 + SSE 流式端点 + MCP /mcp 挂载
   models.py      # Pydantic 数据契约（请求/响应校验）
   agents.py      # 三个 Agent + TravelPlanner 编排器 + 工具定义
   llm.py         # DeepSeek 封装：JSON mode、ReAct 工具循环、JSON 提取
   rag.py         # 语义检索：向量化 + 余弦相似度召回
   tools.py       # travel_minutes 工具（Haversine 距离计算）
   data.py        # 景点知识库（4 城市 × 10 个 POI）
-frontend/src/
-  App.vue        # 表单 + SSE 流式进度 + 行程/预算/路线渲染
+  mcp_server.py  # MCP 服务端：5 个工具（plan_trip / search_places / ...）
+  Dockerfile     # 后端镜像
+frontend/
+  src/App.vue    # 表单 + SSE 流式进度 + 行程/预算/路线渲染
+  Dockerfile     # 前端镜像（node 构建 → nginx 托管）
+  nginx.conf     # SPA 回退 + /api、/mcp 反向代理（SSE 关缓冲）
+docker-compose.yml  # 全栈编排（backend + frontend）
+.mcp.json           # Claude Code 本地 MCP 配置（stdio）
 ```
 
 ## 🧠 设计决策（面试高频）

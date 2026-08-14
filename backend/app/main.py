@@ -1,15 +1,29 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from .agents import TravelPlanner
+from .mcp_server import mcp as trip_mcp
 from .models import TripPlan, TripRequest
 
-app = FastAPI(title="HelloAgents Trip Planner", version="0.2.0")
+# 构建一次 MCP streamable-http 子应用（惰性创建 session manager）
+mcp_app = trip_mcp.streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动 MCP 的 StreamableHTTPSessionManager 任务组；
+    # 不接线会报 "Task group is not initialized"，所有 /mcp 请求都会失败。
+    async with trip_mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="HelloAgents Trip Planner", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,3 +83,7 @@ def stream_trip_plan(request: TripRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---- MCP streamable-http 挂载 ----
+app.mount("/mcp", mcp_app)
