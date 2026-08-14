@@ -34,6 +34,45 @@ const loading = ref(false);
 const error = ref("");
 const progress = ref("");
 
+// ---- 会话记忆：localStorage 持久化 session_id，多轮规划沿用历史偏好 ----
+const SESSION_KEY = "trip_planner_session_id";
+
+function fallbackUuid(): string {
+  const s = () => Math.random().toString(16).slice(2, 8);
+  return `${s()}-${s()}-${s()}`;
+}
+
+function generateUuid(): string {
+  return typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : fallbackUuid();
+}
+
+function getOrCreateSessionId(): string {
+  try {
+    const existing = localStorage.getItem(SESSION_KEY);
+    if (existing) return existing;
+    const fresh = generateUuid();
+    localStorage.setItem(SESSION_KEY, fresh);
+    return fresh;
+  } catch {
+    return generateUuid(); // 隐私模式 / localStorage 不可用时退化为内存会话
+  }
+}
+
+const sessionId = ref<string>(getOrCreateSessionId());
+
+function newSession() {
+  // 换新 ID = 后端视为全新会话（记忆从零开始）
+  sessionId.value = generateUuid();
+  try {
+    localStorage.setItem(SESSION_KEY, sessionId.value);
+  } catch {
+    /* 忽略存储失败 */
+  }
+  plan.value = null;
+  error.value = "";
+  progress.value = "";
+}
+
 const budgetRows = computed(() => {
   if (!plan.value) return [];
   return [
@@ -68,7 +107,7 @@ async function generatePlan() {
     const response = await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(form.value)
+      body: JSON.stringify({ ...form.value, session_id: sessionId.value })
     });
     if (!response.ok || !response.body) {
       throw new Error(`生成失败：HTTP ${response.status}`);
@@ -229,8 +268,15 @@ generatePlan();
           <h2>{{ plan.title }}</h2>
           <p>{{ plan.summary }}</p>
         </div>
-        <button class="secondary-button" type="button" @click="exportJson">导出 JSON</button>
+        <div class="header-actions">
+          <button class="secondary-button" type="button" @click="newSession">新会话</button>
+          <button class="secondary-button" type="button" @click="exportJson">导出 JSON</button>
+        </div>
       </header>
+
+      <div v-if="plan.memory_notes?.length" class="memory-banner">
+        <p v-for="note in plan.memory_notes" :key="note">🧠 {{ note }}</p>
+      </div>
 
       <section class="overview-grid">
         <article class="metric">

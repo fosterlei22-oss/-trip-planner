@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 
 from .data import CITY_PLACES
+from .store import RAG_PREFIX, get_store
 
 # 向量维度。特征哈希把文本映射到固定维度空间，纯 Python 实现、零依赖。
 DIM = 512
+
+# RAG 检索结果缓存时长（秒）：相同查询跳过向量化 + 打分
+RAG_CACHE_TTL = 24 * 3600
 
 # 缓存：city, name, 向量
 _docs: list[tuple[str, str, list[float]]] | None = None
@@ -54,12 +60,24 @@ def _build_docs() -> list[tuple[str, str, list[float]]]:
     return _docs
 
 
+def _cache_key(query: str, city: str | None, top_k: int) -> str:
+    """用查询三元组的序列化哈希做缓存键，天然规避字段边界歧义。"""
+    payload = json.dumps([query, city, top_k], ensure_ascii=False).encode("utf-8")
+    return RAG_PREFIX + hashlib.sha256(payload).hexdigest()
+
+
 def retrieve(query: str, city: str | None = None, top_k: int = 5) -> list[str]:
     """语义检索：把查询向量化，按余弦相似度返回最相关的景点名列表。
 
     where 思路：city 非空时先按城市过滤，再在候选里排序。
     余弦相似度 = 归一化向量的点积。
     """
+    # Redis / 内存缓存：相同 (query, city, top_k) 直接命中，跳过向量化 + 打分
+    key = _cache_key(query, city, top_k)
+    cached = get_store().get(key)
+    if cached is not None:
+        return cached
+
     qv = _embed(query)
     docs = _build_docs()
 
@@ -71,4 +89,6 @@ def retrieve(query: str, city: str | None = None, top_k: int = 5) -> list[str]:
         scored.append((score, name))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [name for _, name in scored[:top_k]]
+    result = [name for _, name in scored[:top_k]]
+    get_store().set(key, result, ttl=RAG_CACHE_TTL)
+    return result

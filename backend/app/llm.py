@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import time
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from .metrics import metrics
+from .store import LLM_PREFIX, get_store
 
 # 读取 backend/.env 里的配置（如 DEEPSEEK_API_KEY）
 load_dotenv()
@@ -12,6 +17,9 @@ load_dotenv()
 # DeepSeek 兼容 OpenAI 接口，所以可以直接用 openai SDK
 BASE_URL = "https://api.deepseek.com"
 MODEL = "deepseek-chat"
+
+# chat_json 响应缓存时长（秒）：相同 (system, user, temperature) 命中，跳过真实调用
+LLM_CACHE_TTL = 7 * 24 * 3600
 
 _client: OpenAI | None = None
 
@@ -26,22 +34,46 @@ def _get_client() -> OpenAI:
     return _client
 
 
-def chat_json(system: str, user: str, temperature: float = 0.3) -> str:
+def _json_cache_key(system: str, user: str, temperature: float) -> str:
+    """chat_json 缓存键：整元组序列化哈希，规避字段边界歧义。"""
+    payload = json.dumps([system, user, temperature], ensure_ascii=False).encode("utf-8")
+    return LLM_PREFIX + hashlib.sha256(payload).hexdigest()
+
+
+def chat_json(system: str, user: str, temperature: float = 0.3, use_cache: bool = True) -> str:
     """调用 DeepSeek，要求以 JSON 对象格式返回，返回 JSON 字符串。
 
     核心点：response_format={"type": "json_object"} 强制模型输出合法 JSON，
     这样下游可以解析后用 Pydantic 校验。
+
+    use_cache=True（默认）：相同 (system, user, temperature) 命中缓存，跳过真实调用；
+    只缓存成功响应。use_cache=False 供评估冷启动测真实延迟。
     """
-    resp = _get_client().chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        response_format={"type": "json_object"},
-        temperature=temperature,
-    )
-    return resp.choices[0].message.content or "{}"
+    key = _json_cache_key(system, user, temperature) if use_cache else None
+    if key is not None:
+        cached = get_store().get(key)
+        if cached is not None:
+            return cached
+
+    start = time.perf_counter()
+    try:
+        resp = _get_client().chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={"type": "json_object"},
+            temperature=temperature,
+        )
+    finally:
+        metrics.inc("llm_calls")
+        metrics.observe("llm", time.perf_counter() - start)
+
+    content = resp.choices[0].message.content or "{}"
+    if key is not None:
+        get_store().set(key, content, ttl=LLM_CACHE_TTL)
+    return content
 
 
 def chat_with_tools(
@@ -62,14 +94,21 @@ def chat_with_tools(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    # 注意：chat_with_tools 不做响应缓存——保住 travel_minutes 真实执行
+    # 的 ReAct 循环，工具成功率度量才有意义。只做耗时/次数埋点。
     for _ in range(max_rounds):
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=temperature,
-        )
+        start = time.perf_counter()
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=temperature,
+            )
+        finally:
+            metrics.inc("llm_calls")
+            metrics.observe("llm", time.perf_counter() - start)
         msg = resp.choices[0].message
 
         # 没有 tool_calls 说明 LLM 想收尾了，返回最终内容

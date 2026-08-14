@@ -9,7 +9,9 @@ from fastapi.responses import StreamingResponse
 
 from .agents import TravelPlanner
 from .mcp_server import mcp as trip_mcp
+from .metrics import metrics
 from .models import TripPlan, TripRequest
+from .store import get_store
 
 # 构建一次 MCP streamable-http 子应用（惰性创建 session manager）
 mcp_app = trip_mcp.streamable_http_app()
@@ -36,9 +38,24 @@ app.add_middleware(
 planner = TravelPlanner()
 
 
+@app.middleware("http")
+async def count_requests(request, call_next):
+    """请求计数（含 SSE 首帧阶段）。"""
+    metrics.inc("requests_total")
+    return await call_next(request)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/metrics")
+def api_metrics() -> dict:
+    """进程内可观测性：请求/LLM/工具计数、各阶段耗时分位数、降级次数、缓存命中率。"""
+    payload = metrics.snapshot()
+    payload["cache"] = get_store().snapshot()
+    return payload
 
 
 # ---- 非流式接口（保留，向后兼容） ----
@@ -62,9 +79,10 @@ def stream_trip_plan(request: TripRequest) -> StreamingResponse:
     """
 
     def event_stream():
+        prepared = planner.prepare(request)  # 合并会话记忆中的历史偏好
         yield _sse("start", {"message": "开始规划行程..."})
         yield _sse("stage", {"stage": "research", "message": "正在语义检索目的地相关景点（RAG）..."})
-        places = planner.researcher.run(request)
+        places = planner.researcher.run(prepared)
         yield _sse(
             "stage",
             {
@@ -72,10 +90,11 @@ def stream_trip_plan(request: TripRequest) -> StreamingResponse:
                 "message": f"已找到 {len(places)} 个候选景点，正在排行程（LLM 调用工具估算交通时间）...",
             },
         )
-        day_plans = planner.itinerary.run(request, places)
+        day_plans = planner.itinerary.run(prepared, places)
         yield _sse("stage", {"stage": "budget", "message": "正在计算预算..."})
-        budget = planner.budget.run(request, day_plans)
-        plan = planner._assemble(request, places, day_plans, budget)
+        budget = planner.budget.run(prepared, day_plans)
+        plan = planner._assemble(prepared, places, day_plans, budget)
+        plan.memory_notes = planner.remember(request)  # 用原始请求回写档案
         yield _sse("result", plan.model_dump(mode="json"))
 
     return StreamingResponse(

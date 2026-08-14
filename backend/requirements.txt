@@ -4,3 +4,4 @@ pydantic
 openai
 python-dotenv
 mcp==1.28.1
+redis>=5

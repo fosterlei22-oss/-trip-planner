@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Literal
 
@@ -19,6 +20,8 @@ class TripRequest(BaseModel):
     interests: list[str] = Field(default_factory=list, max_length=8)
     start_date: date | None = None
     notes: str = Field("", max_length=300)
+    # 会话记忆标识。exclude=True：校验接受、序列化时从 TripPlan.request 里剔除。
+    session_id: str | None = Field(default=None, max_length=128, exclude=True)
 
     @field_validator("destination")
     @classmethod
@@ -32,6 +35,17 @@ class TripRequest(BaseModel):
     @classmethod
     def normalize_interests(cls, value: list[str]) -> list[str]:
         return [item.strip() for item in value if item.strip()]
+
+    @field_validator("session_id")
+    @classmethod
+    def normalize_session_id(cls, value: str | None) -> str | None:
+        """session_id 只允许安全字符；不合法的静默置 None（记忆关闭，绝不报错）。"""
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned or len(cleaned) > 128 or not re.fullmatch(r"[A-Za-z0-9\-_]+", cleaned):
+            return None
+        return cleaned
 
 
 class Place(BaseModel):
@@ -76,3 +90,5 @@ class TripPlan(BaseModel):
     route_points: list[Place]
     packing_list: list[str]
     tips: list[str]
+    # 会话记忆回显：如「已记住你的偏好：历史、美食」
+    memory_notes: list[str] = Field(default_factory=list)

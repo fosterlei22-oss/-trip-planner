@@ -1,4 +1,14 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: helloagents-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   backend:
     build:
       context: ./backend
@@ -6,8 +16,15 @@ services:
     env_file:
       # 真实 API key 只在此处运行时注入，绝不打进镜像
       - ./backend/.env
+    environment:
+      # 显式覆盖：compose 网络内用服务名解析 redis（.env 里可能是 localhost，必须覆盖）
+      REDIS_URL: redis://redis:6379
     ports:
       - "8000:8000"
+    depends_on:
+      # 等 redis 健康后再启动后端；redis 挂了后端仍能靠内存回退兜底运行
+      redis:
+        condition: service_healthy
     healthcheck:
       # python:3.11-slim 没有 curl，用 urllib 打健康检查（fast、不依赖 LLM）
       test:

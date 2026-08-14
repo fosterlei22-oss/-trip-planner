@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 from math import ceil
 
 from .data import CITY_PLACES, DEFAULT_PLACES
 from .llm import chat_json, chat_with_tools, extract_json
+from .memory import memory
+from .metrics import metrics
 from .models import BudgetBreakdown, DayPlan, Place, TripPlan, TripRequest
 from .rag import retrieve
 from .tools import travel_minutes
@@ -34,12 +37,17 @@ def _exec_tool(name: str, args: dict, by_name: dict[str, Place]) -> dict:
         a = by_name.get(args.get("from", ""))
         b = by_name.get(args.get("to", ""))
         if not a or not b:
+            metrics.inc("tool_calls")
+            metrics.inc("tool_errors")
             return {"error": f"未知景点：{args}"}
+        metrics.inc("tool_calls")
         return {
             "from": a.name,
             "to": b.name,
             "minutes": travel_minutes(a.lat, a.lng, b.lat, b.lng),
         }
+    metrics.inc("tool_calls")
+    metrics.inc("tool_errors")
     return {"error": f"未知工具：{name}"}
 
 
@@ -53,17 +61,22 @@ class DestinationResearchAgent:
     """
 
     def run(self, request: TripRequest) -> list[Place]:
-        # 1) RAG 语义检索，先召回与用户需求最相关的景点
-        candidates = self._retrieve_candidates(request)
-        if not request.interests:
-            return candidates
-
-        # 2) LLM 在候选中挑选排序
+        start = time.perf_counter()
         try:
-            return self._llm_select(request, candidates)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[DestinationResearchAgent] LLM 不可用，退回规则版：{exc}")
-            return self._rule_based(request, candidates)
+            # 1) RAG 语义检索，先召回与用户需求最相关的景点
+            candidates = self._retrieve_candidates(request)
+            if not request.interests:
+                return candidates
+
+            # 2) LLM 在候选中挑选排序
+            try:
+                return self._llm_select(request, candidates)
+            except Exception as exc:  # noqa: BLE001
+                metrics.record_fallback("research")
+                print(f"[DestinationResearchAgent] LLM 不可用，退回规则版：{exc}")
+                return self._rule_based(request, candidates)
+        finally:
+            metrics.observe("research", time.perf_counter() - start)
 
     def _retrieve_candidates(self, request: TripRequest) -> list[Place]:
         """RAG 召回：把用户需求拼成自然语言查询，向量检索 top-k 景点。
@@ -79,6 +92,7 @@ class DestinationResearchAgent:
                 print(f"[DestinationResearchAgent] RAG 召回：{[p.name for p in picked]}")
                 return picked
         except Exception as exc:  # noqa: BLE001
+            metrics.inc("rag_errors")
             print(f"[DestinationResearchAgent] RAG 不可用：{exc}")
         return CITY_PLACES.get(request.destination, DEFAULT_PLACES)
 
@@ -115,7 +129,23 @@ class DestinationResearchAgent:
         content = chat_json(system, user)
         data = json.loads(content)
         by_name = {p.name: p for p in places}
-        picked = [by_name[item["name"]] for item in data.get("places", []) if item.get("name") in by_name]
+        # 保序去重：LLM 可能重复输出同一景点（评估抓到的真实 case：sh-foodie-1）。
+        # 候选列表带重会让单日行程出现同名景点，破坏「每天 3 个互异」不变式。
+        picked: list[Place] = []
+        seen: set[str] = set()
+        for item in data.get("places", []):
+            name = item.get("name")
+            if name in by_name and name not in seen:
+                seen.add(name)
+                picked.append(by_name[name])
+        # 兜底：去重后不足 3 个时，用规则版排序的候选补齐——保证任意一天都能排满 3 个互异景点。
+        if len(picked) < 3:
+            for place in self._rule_based(request, places):
+                if len(picked) >= 3:
+                    break
+                if place.name not in seen:
+                    seen.add(place.name)
+                    picked.append(place)
         print(f"[DestinationResearchAgent] LLM 挑选：{[p.name for p in picked]}")
         return picked or self._rule_based(request, places)
 
@@ -125,11 +155,16 @@ class ItineraryAgent:
     无 key 或失败时退回规则版。"""
 
     def run(self, request: TripRequest, places: list[Place]) -> list[DayPlan]:
+        start = time.perf_counter()
         try:
-            return self._llm_itinerary(request, places)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[ItineraryAgent] LLM 不可用，退回规则版：{exc}")
-            return self._rule_based(request, places)
+            try:
+                return self._llm_itinerary(request, places)
+            except Exception as exc:  # noqa: BLE001
+                metrics.record_fallback("itinerary")
+                print(f"[ItineraryAgent] LLM 不可用，退回规则版：{exc}")
+                return self._rule_based(request, places)
+        finally:
+            metrics.observe("itinerary", time.perf_counter() - start)
 
     def _rule_based(self, request: TripRequest, places: list[Place]) -> list[DayPlan]:
         days: list[DayPlan] = []
@@ -243,6 +278,14 @@ class ItineraryAgent:
 
 class BudgetAgent:
     def run(self, request: TripRequest, day_plans: list[DayPlan]) -> BudgetBreakdown:
+        start = time.perf_counter()
+        try:
+            return self._compute(request, day_plans)
+        finally:
+            metrics.observe("budget", time.perf_counter() - start)
+
+    @staticmethod
+    def _compute(request: TripRequest, day_plans: list[DayPlan]) -> BudgetBreakdown:
         lodging_per_room = {"economy": 260, "standard": 520, "comfort": 900}[request.budget_level]
         rooms = ceil(request.people / 2)
         lodging = lodging_per_room * rooms * max(request.days - 1, 1)
@@ -270,11 +313,23 @@ class TravelPlanner:
         self.itinerary = ItineraryAgent()
         self.budget = BudgetAgent()
 
+    def prepare(self, request: TripRequest) -> TripRequest:
+        """把会话记忆里的历史偏好合并进本次请求（无 session_id 则原样返回）。"""
+        return memory.prepare(request)
+
+    def remember(self, request: TripRequest) -> list[str]:
+        """用原始请求更新会话档案，返回 memory_notes 回显文案。"""
+        return memory.remember(request)
+
     def plan(self, request: TripRequest) -> TripPlan:
-        places = self.researcher.run(request)
-        day_plans = self.itinerary.run(request, places)
-        budget = self.budget.run(request, day_plans)
-        return self._assemble(request, places, day_plans, budget)
+        prepared = self.prepare(request)
+        places = self.researcher.run(prepared)
+        day_plans = self.itinerary.run(prepared, places)
+        budget = self.budget.run(prepared, day_plans)
+        plan = self._assemble(prepared, places, day_plans, budget)
+        # 用原始 request 记录，避免「历史 + 本次」合并值再次入档案导致指数膨胀
+        plan.memory_notes = self.remember(request)
+        return plan
 
     def _assemble(
         self,
