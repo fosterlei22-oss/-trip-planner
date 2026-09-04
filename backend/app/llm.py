@@ -138,7 +138,7 @@ def extract_json(text: str) -> dict:
     """从模型输出中稳健地解析出 JSON 对象。
 
     模型经常把 JSON 包在 markdown 代码块里，或前面写一大段思考文字，
-    所以不能直接 json.loads。依次尝试：直接解析 → 去掉代码块围栏 → 截取 {} 区间。
+    所以不能直接 json.loads。依次尝试：直接解析 → 去掉代码块围栏 → 定位首个完整 JSON 对象。
     """
     text = text.strip()
 
@@ -156,10 +156,17 @@ def extract_json(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # 兜底：截取第一个 { 到最后一个 } 之间的内容
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(text[start : end + 1])
+    # 兜底：从每个左花括号开始尝试，读取第一个完整 JSON 对象。
+    # raw_decode 会在对象结束处停止，因此能容忍 JSON 后面附带文字或第二段内容。
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
 
     raise ValueError(f"无法从模型输出解析 JSON：{text[:100]!r}")
